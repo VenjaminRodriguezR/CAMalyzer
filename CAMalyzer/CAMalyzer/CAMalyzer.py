@@ -15,6 +15,16 @@ from slicer.parameterNodeWrapper import (
 from slicer import vtkMRMLScalarVolumeNode, vtkMRMLLabelMapVolumeNode, vtkMRMLModelNode
 
 
+import torch
+import numpy as np
+from monai.inferers import sliding_window_inference
+from monai.transforms import Compose, ScaleIntensity, Activations, AsDiscrete
+from monai.data import decollate_batch
+from skimage import measure
+import open3d as o3d
+from vtk.util.numpy_support import vtk_to_numpy
+from slicer.ScriptedLoadableModule import ScriptedLoadableModuleLogic
+
 #
 # CAMalyzer
 #
@@ -250,21 +260,22 @@ class CAMalyzerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
 
 
     
+    
     def onModelPathButtonClicked(self) -> None:
         """
-        Open a file dialog to select a model file and update the parameter node.
+        Open a file dialog to select a model file and update the QLineEdit widget.
         """
         try:
             filePath = QFileDialog.getOpenFileName(
                 self.parent,
-                "Select Model File",
-                "",  # Carpeta inicial
-                "Model Files (*.pth)"  # Filtro para mostrar archivos .pth
-            )[0]
-            if filePath:
-                self.ui.ModelPathLineEdit.text = filePath
+                "Select Model File",  # Title of the dialog
+                "",                   # Initial directory (empty means default)
+                "Model Files (*.pth)" # Filter for file types
+            )
+            if filePath:  # Check if a file was selected
+                self.ui.modelForPrediction.setText(filePath)  # Update QLineEdit widget
                 if self._parameterNode:
-                    self._parameterNode.modelForPrediction = filePath
+                    self._parameterNode.modelForPrediction = filePath  # Update parameter node
         except Exception as e:
             slicer.util.errorDisplay(f"Failed to select model file: {str(e)}")
 
@@ -277,27 +288,207 @@ class CAMalyzerWidget(ScriptedLoadableModuleWidget, VTKObservationMixin):
                 inputVolume=self._parameterNode.inputVolume,
                 modelForPrediction=self._parameterNode.modelForPrediction,
                 outputLabelMap=self._parameterNode.outputLabelMap,
-                modelOutput=self._parameterNode.modelOutput
+                modelOutput=self._parameterNode.modelOutput,roi_size=(96, 96, 96),
+                sw_batch_size=4
             )
 
 #
 # CAMalyzerLogic
 #
+import logging
+import slicer
+import os
+import sys
+import importlib.util
+from slicer.ScriptedLoadableModule import ScriptedLoadableModuleLogic
+
 
 class CAMalyzerLogic(ScriptedLoadableModuleLogic):
-    """This class should implement all the actual
-    computation done by your module.  The interface
-    should be such that other python code can import
-    this class and make use of the functionality without
-    requiring an instance of the Widget.
-    Uses ScriptedLoadableModuleLogic base class, available at:
-    https://github.com/Slicer/Slicer/blob/main/Base/Python/slicer/ScriptedLoadableModule.py
+    """
+    CAMalyzerLogic handles automatic segmentation, dependency management, and 3D model generation.
     """
 
     def __init__(self) -> None:
         """
-        Called when the logic class is instantiated. Can be used for initializing member variables.
+        Initialize logic and ensure dependencies are installed.
         """
+        super().__init__()
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        logging.info(f"Device set to: {self.device}")
+        self.check_and_install_dependencies()
+
+    def check_and_install_dependencies(self):
+        """
+        Ensure all required Python packages are installed in the Slicer environment.
+        """
+        required_packages = [
+            "torch",
+            "monai",
+            "numpy",
+            "scikit-image",
+            "open3d"
+        ]
+        for package in required_packages:
+            self.install_package_if_missing(package)
+
+    def install_package_if_missing(self, package_name):
+        """
+        Check if a package is installed, and if not, install it using pip.
+        """
+        try:
+            # Use importlib.util.find_spec to check if the package is installed
+            if importlib.util.find_spec(package_name) is None:
+                logging.info(f"Installing missing package: {package_name}")
+                slicer.util.showStatusMessage(f"Installing {package_name}...", 2000)
+                slicer.util.pip_install(package_name)
+                logging.info(f"Successfully installed package: {package_name}")
+        except Exception as e:
+            slicer.util.errorDisplay(f"Failed to install {package_name}: {str(e)}")
+            raise
+
+    def getParameterNode(self):
+        """
+        Get the parameter node wrapped with CAMalyzerParameterNode.
+        """
+        return CAMalyzerParameterNode(super().getParameterNode())
+
+    def load_model(self, model_path: str) -> torch.nn.Module:
+        """
+        Load a pre-trained PyTorch model.
+        """
+        if not os.path.isfile(model_path):
+            raise ValueError(f"Model file not found: {model_path}")
+
+        import monai
+        model = monai.networks.nets.UNet(
+            spatial_dims=3,
+            in_channels=1,
+            out_channels=1,
+            kernel_size=3,
+            channels=(16, 32, 64, 128, 256),
+            strides=(2, 2, 2, 2),
+            num_res_units=2,
+            dropout=0.125
+        ).to(self.device)
+
+        import torch
+        checkpoint = torch.load(model_path, map_location=self.device)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        model.eval()
+        logging.info(f"Model loaded from {model_path}")
+        return model
+
+    def process(self,
+                inputVolume: vtkMRMLScalarVolumeNode,
+                modelForPrediction: str,
+                outputLabelMap: vtkMRMLScalarVolumeNode,
+                modelOutput: vtkMRMLModelNode,
+                roi_size=(96, 96, 96),
+                sw_batch_size=4,
+                showResult: bool = True) -> None:
+        """
+        Process the input volume using the specified model and generate outputs.
+        """
+        if not inputVolume or not outputLabelMap or not modelOutput:
+            raise ValueError("Input volume, output label map, or model output is invalid")
+        if not os.path.isfile(modelForPrediction):
+            raise ValueError(f"Model file not found: {modelForPrediction}")
+
+        logging.info(f"Processing started with model: {modelForPrediction}")
+
+        # Load the model
+        model = self.load_model(modelForPrediction)
+
+        # Preprocess and segment
+        import numpy as np
+        import torch
+        from monai.inferers import sliding_window_inference
+        from monai.transforms import Compose, ScaleIntensity, Activations, AsDiscrete
+        from monai.data import decollate_batch
+        from skimage import measure
+        import open3d as o3d
+
+        volume_array = slicer.util.arrayFromVolume(inputVolume)
+        volume_tensor = torch.from_numpy(volume_array).float().permute(2, 1, 0).unsqueeze(0).unsqueeze(0)
+        volume_tensor = ScaleIntensity()(volume_tensor).to(self.device)
+
+        post_trans = Compose([Activations(sigmoid=True), AsDiscrete(threshold=0.5)])
+
+        with torch.no_grad():
+            prediction = sliding_window_inference(volume_tensor, roi_size, sw_batch_size, model)
+            prediction = [post_trans(p) for p in decollate_batch(prediction)]
+            segmented_array = prediction[0].cpu().squeeze().permute(2, 1, 0).numpy()
+
+        logging.info(f"Segmentation completed. Shape: {segmented_array.shape}")
+
+        # Update the label map
+        slicer.util.updateVolumeFromArray(outputLabelMap, segmented_array)
+        ijk_to_ras_matrix = vtk.vtkMatrix4x4()
+        inputVolume.GetIJKToRASMatrix(ijk_to_ras_matrix)
+        outputLabelMap.SetIJKToRASMatrix(ijk_to_ras_matrix)
+
+        # Generate and clean the 3D model
+        verts, faces, _, _ = measure.marching_cubes(segmented_array, level=0.5)
+
+        mesh = o3d.geometry.TriangleMesh()
+        mesh.vertices = o3d.utility.Vector3dVector(verts)
+        mesh.triangles = o3d.utility.Vector3iVector(faces)
+        mesh.compute_vertex_normals()
+
+        point_cloud = mesh.sample_points_uniformly(number_of_points=100000)
+        labels = np.array(point_cloud.cluster_dbscan(eps=10, min_points=150, print_progress=True))
+        max_cluster_index = np.bincount(labels[labels >= 0]).argmax()
+        filtered_points = point_cloud.select_by_index(np.where(labels == max_cluster_index)[0])
+
+        mesh_filtered, _ = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(filtered_points, depth=9)
+
+        # Smooth the mesh using VTK
+        polydata = vtk.vtkPolyData()
+        vtk_points = vtk.vtkPoints()
+        vtk_triangles = vtk.vtkCellArray()
+        for vert in np.asarray(mesh_filtered.vertices):
+            vtk_points.InsertNextPoint(vert)
+        for face in np.asarray(mesh_filtered.triangles):
+            triangle = vtk.vtkTriangle()
+            for i in range(3):
+                triangle.GetPointIds().SetId(i, face[i])
+            vtk_triangles.InsertNextCell(triangle)
+        polydata.SetPoints(vtk_points)
+        polydata.SetPolys(vtk_triangles)
+
+        smoother = vtk.vtkSmoothPolyDataFilter()
+        smoother.SetInputData(polydata)
+        smoother.SetNumberOfIterations(50)
+        smoother.Update()
+
+        smoothed_polydata = smoother.GetOutput()
+        modelOutput.SetAndObservePolyData(smoothed_polydata)
+        modelOutput.CreateDefaultDisplayNodes()
+        modelOutput.GetDisplayNode().SetColor(0.5, 0.8, 1.0)
+
+        logging.info("3D model generation completed.")
+
+        if showResult:
+            slicer.util.setSliceViewerLayers(background=inputVolume, label=outputLabelMap)
+            slicer.util.showStatusMessage("Segmentation and model generation completed.", 2000)
+
+        logging.info("Processing finished.")
+
+
+"""
+class CAMalyzerLogic(ScriptedLoadableModuleLogic):
+    #This class should implement all the actual
+    #computation done by your module.  The interface
+    #should be such that other python code can import
+    #this class and make use of the functionality without
+    #requiring an instance of the Widget.
+    #Uses ScriptedLoadableModuleLogic base class, available at:
+    #https://github.com/Slicer/Slicer/blob/main/Base/Python/slicer/ScriptedLoadableModule.py
+    
+
+    def __init__(self) -> None:
+    
+        #Called when the logic class is instantiated. Can be used for initializing member variables.
         ScriptedLoadableModuleLogic.__init__(self)
 
     def getParameterNode(self):
@@ -309,9 +500,9 @@ class CAMalyzerLogic(ScriptedLoadableModuleLogic):
             outputLabelMap: vtkMRMLScalarVolumeNode,
             modelOutput: str = "",
             showResult: bool = True) -> None:
-        """
-        Process the input volume using the specified model and generate outputs.
-        """
+        
+        #Process the input volume using the specified model and generate outputs.
+        
         if not inputVolume or not outputLabelMap:
             raise ValueError("Input volume or output label map is invalid")
         if not os.path.isfile(modelForPrediction):
@@ -328,7 +519,7 @@ class CAMalyzerLogic(ScriptedLoadableModuleLogic):
             slicer.util.showStatusMessage(f"Processing completed: {modelOutput}", 2000)
 
         logging.info("Processing finished.")
-
+"""
 
 #
 # CAMalyzerTest

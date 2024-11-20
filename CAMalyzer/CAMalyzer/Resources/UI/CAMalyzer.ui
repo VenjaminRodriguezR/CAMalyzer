@@ -68,9 +68,9 @@
        </widget>
       </item>
       <item row="3" column="1">
-       <widget class="QLineEdit" name="ModelForPrediction">
+       <widget class="QLineEdit" name="modelForPrediction">
         <property name="readOnly">
-         <bool>true</bool>
+         <bool>false</bool>
         </property>
         <property name="placeholderText">
          <string>Select the path to the .pth model</string>
@@ -168,7 +168,7 @@
    <item>
     <widget class="QPushButton" name="applyButton">
      <property name="enabled">
-      <bool>false</bool>
+      <bool>true</bool>
      </property>
      <property name="toolTip">
       <string>Run the algorithm.</string>
