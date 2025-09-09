@@ -383,27 +383,40 @@ class CAMalyzerLogic(ScriptedLoadableModuleLogic):
         return model
 
     def process(self,
-                inputVolume: vtkMRMLScalarVolumeNode,
-                modelForPrediction: str,
-                outputLabelMap: vtkMRMLScalarVolumeNode,
-                modelOutput: vtkMRMLModelNode,
-                roi_size=(96, 96, 96),
-                sw_batch_size=4,
-                showResult: bool = True) -> None:
-        """
-        Process the input volume using the specified model and generate outputs.
-        """
+            inputVolume: vtkMRMLScalarVolumeNode,
+            modelForPrediction: str,
+            outputLabelMap: vtkMRMLLabelMapVolumeNode,
+            modelOutput: vtkMRMLModelNode,
+            roi_size=(96, 96, 96),
+            sw_batch_size=4,
+            showResult: bool = True) -> None:
+
         if not inputVolume or not outputLabelMap or not modelOutput:
             raise ValueError("Input volume, output label map, or model output is invalid")
         if not os.path.isfile(modelForPrediction):
             raise ValueError(f"Model file not found: {modelForPrediction}")
 
+        # ---- Names derived from input (consistent, human-readable)
+        base = inputVolume.GetName() or "Input"
+        name_seg_raw     = f"{base}_SegRaw"
+        name_seg_opened  = f"{base}_SegOpened"
+        name_model_final = f"{base}_ModelPoisson"
+        name_seg_frommdl = f"{base}_SegFromModel"          # editable segmentation
+        name_lbl_frommdl = f"{base}_SegFromModel_Label"    # exported labelmap
+
+        # Ensure OpenCV is available
+        try:
+            import cv2  # noqa
+        except Exception:
+            self.install_package_if_missing("opencv-python-headless")
+            import cv2  # noqa
+
         logging.info(f"Processing started with model: {modelForPrediction}")
 
-        # Load the model
+        # ---- Load model
         model = self.load_model(modelForPrediction)
 
-        # Preprocess and segment
+        # ---- Preprocess + inference
         import numpy as np
         import torch
         from monai.inferers import sliding_window_inference
@@ -411,8 +424,9 @@ class CAMalyzerLogic(ScriptedLoadableModuleLogic):
         from monai.data import decollate_batch
         from skimage import measure
         import open3d as o3d
+        from vtk.util.numpy_support import vtk_to_numpy
 
-        volume_array = slicer.util.arrayFromVolume(inputVolume)
+        volume_array = slicer.util.arrayFromVolume(inputVolume)  # (z,y,x)
         volume_tensor = torch.from_numpy(volume_array).float().permute(2, 1, 0).unsqueeze(0).unsqueeze(0)
         volume_tensor = ScaleIntensity()(volume_tensor).to(self.device)
 
@@ -421,109 +435,163 @@ class CAMalyzerLogic(ScriptedLoadableModuleLogic):
         with torch.no_grad():
             prediction = sliding_window_inference(volume_tensor, roi_size, sw_batch_size, model)
             prediction = [post_trans(p) for p in decollate_batch(prediction)]
-            segmented_array = prediction[0].cpu().squeeze().permute(2, 1, 0).numpy()
+            segmented_array = prediction[0].cpu().squeeze().permute(2, 1, 0).numpy().astype(np.uint8)
 
         logging.info(f"Segmentation completed. Shape: {segmented_array.shape}")
 
-        # Update the label map
+        # ---- Raw segmentation → outputLabelMap (named, aligned)
+        outputLabelMap.SetName(name_seg_raw)
         slicer.util.updateVolumeFromArray(outputLabelMap, segmented_array)
         ijk_to_ras_matrix = vtk.vtkMatrix4x4()
         inputVolume.GetIJKToRASMatrix(ijk_to_ras_matrix)
         outputLabelMap.SetIJKToRASMatrix(ijk_to_ras_matrix)
 
-        # Generate and clean the 3D model
-        verts, faces, _, _ = measure.marching_cubes(segmented_array, level=0.5)
+        # ---- OpenCV 2D opening (kernel 7, repeat 10×) per axial slice
+        opened_array = np.zeros_like(segmented_array, dtype=np.uint8)
+        kernel_size = 7
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_size, kernel_size))
+        for z in range(segmented_array.shape[0]):
+            slice_img = (segmented_array[z] * 255).astype(np.uint8)
+            slice_opened = slice_img
+            for _ in range(10):
+                slice_opened = cv2.morphologyEx(slice_opened, cv2.MORPH_OPEN, kernel)
+            opened_array[z] = (slice_opened > 0).astype(np.uint8)
 
-        mesh = o3d.geometry.TriangleMesh()
-        mesh.vertices = o3d.utility.Vector3dVector(verts)
-        mesh.triangles = o3d.utility.Vector3iVector(faces)
-        mesh.compute_vertex_normals()
+        # ---- Intermediate opened labelmap (new node, named, aligned)
+        openedLabelMap = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLLabelMapVolumeNode", name_seg_opened)
+        slicer.util.updateVolumeFromArray(openedLabelMap, opened_array)
+        openedLabelMap.SetIJKToRASMatrix(ijk_to_ras_matrix)
 
-        point_cloud = mesh.sample_points_uniformly(number_of_points=100000)
-        labels = np.array(point_cloud.cluster_dbscan(eps=10, min_points=150, print_progress=True))
-        max_cluster_index = np.bincount(labels[labels >= 0]).argmax()
-        filtered_points = point_cloud.select_by_index(np.where(labels == max_cluster_index)[0])
+        # ---- Surface from opened mask → smooth → DBSCAN → Poisson
+        verts, faces, _, _ = measure.marching_cubes(opened_array, level=0.5)
 
-        mesh_filtered, _ = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(filtered_points, depth=9)
-
-        # Smooth the mesh using VTK
-        polydata = vtk.vtkPolyData()
-        vtk_points = vtk.vtkPoints()
-        vtk_triangles = vtk.vtkCellArray()
-        for vert in np.asarray(mesh_filtered.vertices):
-            vtk_points.InsertNextPoint(vert)
-        for face in np.asarray(mesh_filtered.triangles):
-            triangle = vtk.vtkTriangle()
-            for i in range(3):
-                triangle.GetPointIds().SetId(i, face[i])
-            vtk_triangles.InsertNextCell(triangle)
-        polydata.SetPoints(vtk_points)
-        polydata.SetPolys(vtk_triangles)
+        points = vtk.vtkPoints()
+        for v in verts:
+            points.InsertNextPoint(float(v[0]), float(v[1]), float(v[2]))
+        polyData = vtk.vtkPolyData()
+        polyData.SetPoints(points)
+        triangles = vtk.vtkCellArray()
+        for f in faces:
+            tri = vtk.vtkTriangle()
+            tri.GetPointIds().SetId(0, int(f[0]))
+            tri.GetPointIds().SetId(1, int(f[1]))
+            tri.GetPointIds().SetId(2, int(f[2]))
+            triangles.InsertNextCell(tri)
+        polyData.SetPolys(triangles)
 
         smoother = vtk.vtkSmoothPolyDataFilter()
-        smoother.SetInputData(polydata)
+        smoother.SetInputData(polyData)
         smoother.SetNumberOfIterations(50)
+        smoother.SetRelaxationFactor(0.1)
+        smoother.FeatureEdgeSmoothingOff()
+        smoother.BoundarySmoothingOn()
         smoother.Update()
 
-        smoothed_polydata = smoother.GetOutput()
+        smoothedPolyData = smoother.GetOutput()
+        verts_sm = vtk_to_numpy(smoothedPolyData.GetPoints().GetData())
+        faces_sm = vtk_to_numpy(smoothedPolyData.GetPolys().GetData()).reshape(-1, 4)[:, 1:4]
+
+        mesh_sm = o3d.geometry.TriangleMesh()
+        mesh_sm.vertices = o3d.utility.Vector3dVector(verts_sm)
+        mesh_sm.triangles = o3d.utility.Vector3iVector(faces_sm)
+        mesh_sm.compute_vertex_normals()
+
+        point_cloud = mesh_sm.sample_points_uniformly(number_of_points=100_000)
+        labels = np.array(point_cloud.cluster_dbscan(eps=10, min_points=150, print_progress=True))
+        valid = labels >= 0
+        if not np.any(valid):
+            raise RuntimeError("DBSCAN produced no valid clusters; adjust eps/min_points.")
+        max_cluster = np.bincount(labels[valid]).argmax()
+        pcd_filtered = point_cloud.select_by_index(np.where(labels == max_cluster)[0])
+
+        with o3d.utility.VerbosityContextManager(o3d.utility.VerbosityLevel.Debug) as cm:
+            mesh_filtered, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(pcd_filtered, depth=9)
+        mesh_filtered.compute_vertex_normals()
+
+        # ---- Poisson mesh → VTK → smooth again → modelOutput (named)
+        polydata = vtk.vtkPolyData()
+        vtk_points = vtk.vtkPoints()
+        vtk_tris = vtk.vtkCellArray()
+        verts_np = np.asarray(mesh_filtered.vertices)
+        tris_np = np.asarray(mesh_filtered.triangles)
+        for v in verts_np:
+            vtk_points.InsertNextPoint(float(v[0]), float(v[1]), float(v[2]))
+        for t in tris_np:
+            tri = vtk.vtkTriangle()
+            tri.GetPointIds().SetId(0, int(t[0]))
+            tri.GetPointIds().SetId(1, int(t[1]))
+            tri.GetPointIds().SetId(2, int(t[2]))
+            vtk_tris.InsertNextCell(tri)
+        polydata.SetPoints(vtk_points)
+        polydata.SetPolys(vtk_tris)
+
+        sm2 = vtk.vtkSmoothPolyDataFilter()
+        sm2.SetInputData(polydata)
+        sm2.SetNumberOfIterations(100)
+        sm2.Update()
+
+        modelOutput.SetName(name_model_final)
+        smoothed_polydata = sm2.GetOutput()
         modelOutput.SetAndObservePolyData(smoothed_polydata)
         modelOutput.CreateDefaultDisplayNodes()
         modelOutput.GetDisplayNode().SetColor(0.5, 0.8, 1.0)
 
-        logging.info("3D model generation completed.")
+        logging.info("3D model generation completed (Poisson + normals).")
+
+        # =====================================================================
+        # Convert final model → editable Segmentation (robust, version-safe)
+        # =====================================================================
+        logicSeg = slicer.modules.segmentations.logic()
+
+        # 1) Segmentation node (geometry will be seeded from labelmap)
+        segNode = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLSegmentationNode", name_seg_frommdl)
+        segNode.CreateDefaultDisplayNodes()
+
+        # 2) Seed segmentation geometry by importing the OPENED labelmap
+        #    This guarantees a Binary labelmap master with correct grid.
+        logicSeg.ImportLabelmapToSegmentationNode(openedLabelMap, segNode)
+
+        # 3) Hide the 'opened' seed segment so only the model will be exported later
+        seg = segNode.GetSegmentation()
+        ids = vtk.vtkStringArray()
+        seg.GetSegmentIDs(ids)
+        for i in range(ids.GetNumberOfValues()):
+            sid = ids.GetValue(i)
+            segNode.GetDisplayNode().SetSegmentVisibility(sid, False)
+
+        # 4) Import the Poisson model as a new segment; make it visible
+        before = seg.GetNumberOfSegments()
+        logicSeg.ImportModelToSegmentationNode(modelOutput, segNode)
+        after = seg.GetNumberOfSegments()
+        if after <= before:
+            raise RuntimeError("ImportModelToSegmentationNode failed: no new segment added from model.")
+
+        # Rename the last-added segment to "Poisson" and make it visible
+        last_id = seg.GetNthSegmentID(after - 1)
+        seg.GetSegment(last_id).SetName("Poisson")
+        segNode.GetDisplayNode().SetSegmentVisibility(last_id, True)
+
+        # 5) Create the TARGET LabelMap and initialize its geometry/data to match input
+        segLabel = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLLabelMapVolumeNode", name_lbl_frommdl)
+        zeros = np.zeros_like(opened_array, dtype=np.uint8)  # correct shape
+        slicer.util.updateVolumeFromArray(segLabel, zeros)
+        segLabel.SetIJKToRASMatrix(ijk_to_ras_matrix)
+
+        # 6) Export *visible* segments (only "Poisson") to the labelmap, aligned to input
+        ok = logicSeg.ExportVisibleSegmentsToLabelmapNode(segNode, segLabel, inputVolume)
+        if not ok:
+            raise RuntimeError("ExportVisibleSegmentsToLabelmapNode failed; check segment visibility and geometry.")
 
         if showResult:
-            slicer.util.setSliceViewerLayers(background=inputVolume, label=outputLabelMap)
-            slicer.util.showStatusMessage("Segmentation and model generation completed.", 2000)
+            # Show the exported labelmap to confirm voxel-space export
+            slicer.util.setSliceViewerLayers(background=inputVolume, label=segLabel)
+            slicer.util.showStatusMessage(
+                "Opened labelmap, Poisson model, editable segmentation, and exported labelmap created.", 2000
+            )
 
         logging.info("Processing finished.")
 
 
-"""
-class CAMalyzerLogic(ScriptedLoadableModuleLogic):
-    #This class should implement all the actual
-    #computation done by your module.  The interface
-    #should be such that other python code can import
-    #this class and make use of the functionality without
-    #requiring an instance of the Widget.
-    #Uses ScriptedLoadableModuleLogic base class, available at:
-    #https://github.com/Slicer/Slicer/blob/main/Base/Python/slicer/ScriptedLoadableModule.py
-    
-
-    def __init__(self) -> None:
-    
-        #Called when the logic class is instantiated. Can be used for initializing member variables.
-        ScriptedLoadableModuleLogic.__init__(self)
-
-    def getParameterNode(self):
-        return CAMalyzerParameterNode(super().getParameterNode())
-
-    def process(self,
-            inputVolume: vtkMRMLScalarVolumeNode,
-            modelForPrediction: str,
-            outputLabelMap: vtkMRMLScalarVolumeNode,
-            modelOutput: str = "",
-            showResult: bool = True) -> None:
-        
-        #Process the input volume using the specified model and generate outputs.
-        
-        if not inputVolume or not outputLabelMap:
-            raise ValueError("Input volume or output label map is invalid")
-        if not os.path.isfile(modelForPrediction):
-            raise ValueError(f"Model file not found: {modelForPrediction}")
-
-        logging.info(f"Processing started with model: {modelForPrediction}")
-
-        # Example logic for loading and applying the model
-        # Replace this with actual deep learning inference logic
-        result = "Prediction completed successfully."  # Placeholder for model result
-        modelOutput = result
-
-        if showResult:
-            slicer.util.showStatusMessage(f"Processing completed: {modelOutput}", 2000)
-
-        logging.info("Processing finished.")
-"""
 
 #
 # CAMalyzerTest
