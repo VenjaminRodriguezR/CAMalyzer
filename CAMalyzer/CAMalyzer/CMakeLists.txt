@@ -4,11 +4,23 @@ set(MODULE_NAME CAMalyzer)
 #-----------------------------------------------------------------------------
 set(MODULE_PYTHON_SCRIPTS
   ${MODULE_NAME}.py
+  Lib/camalyzer_core/__init__.py
+  Lib/camalyzer_core/config.py
+  Lib/camalyzer_core/params.py
+  Lib/camalyzer_core/deps.py
+  Lib/camalyzer_core/io.py
+  Lib/camalyzer_core/inference.py
+  Lib/camalyzer_core/vtkconv.py
+  Lib/camalyzer_core/profiling.py
+  Lib/camalyzer_core/post/__init__.py
+  Lib/camalyzer_core/post/surface.py
+  Lib/camalyzer_core/post/cluster.py
+  Lib/camalyzer_core/post/poisson.py
   )
 
 set(MODULE_PYTHON_RESOURCES
   Resources/Icons/${MODULE_NAME}.png
-  Resources/UI/${MODULE_NAME}.ui
+  UI/${MODULE_NAME}.ui
   )
 
 #-----------------------------------------------------------------------------
