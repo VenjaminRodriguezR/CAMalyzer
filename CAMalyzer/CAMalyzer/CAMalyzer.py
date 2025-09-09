@@ -11,9 +11,13 @@ from slicer.parameterNodeWrapper import (
     parameterNodeWrapper,
     WithinRange,
 )
-
+import time
+import threading
+import statistics
+import gc
+import psutil
+import math
 from slicer import vtkMRMLScalarVolumeNode, vtkMRMLLabelMapVolumeNode, vtkMRMLModelNode
-
 
 import torch
 import numpy as np
@@ -23,7 +27,7 @@ from monai.data import decollate_batch
 from skimage import measure
 import open3d as o3d
 from vtk.util.numpy_support import vtk_to_numpy
-from slicer.ScriptedLoadableModule import ScriptedLoadableModuleLogic
+from slicer.ScriptedLoadableModule import ScriptedLoadableModuleLogic, ScriptedLoadableModuleTest
 
 #
 # CAMalyzer
@@ -318,18 +322,18 @@ class CAMalyzerLogic(ScriptedLoadableModuleLogic):
         self.check_and_install_dependencies()
 
     def check_and_install_dependencies(self):
-        """
-        Ensure all required Python packages are installed in the Slicer environment.
-        """
-        required_packages = [
-            "torch",
-            "monai",
-            "numpy",
-            "scikit-image",
-            "open3d"
-        ]
-        for package in required_packages:
-            self.install_package_if_missing(package)
+                required_packages = [
+                    "torch",
+                    "monai",
+                    "numpy",
+                    "scikit-image",
+                    "open3d",
+                    "psutil",
+                    "pynvml",
+                    "scipy"
+                ]
+                for package in required_packages:
+                    self.install_package_if_missing(package)
 
     def install_package_if_missing(self, package_name):
         """
@@ -527,64 +531,61 @@ class CAMalyzerLogic(ScriptedLoadableModuleLogic):
 
 class CAMalyzerTest(ScriptedLoadableModuleTest):
     """
-    This is the test case for your scripted module.
-    Uses ScriptedLoadableModuleTest base class, available at:
-    https://github.com/Slicer/Slicer/blob/main/Base/Python/slicer/ScriptedLoadableModule.py
+    This is the test case for the CAMalyzer module.
     """
 
     def setUp(self):
-        """ Do whatever is needed to reset the state - typically a scene clear will be enough.
+        """
+        Reset the state by clearing the scene.
         """
         slicer.mrmlScene.Clear()
 
     def runTest(self):
-        """Run as few or as many tests as needed here.
+        """
+        Run the test case.
         """
         self.setUp()
-        self.test_CAMalyzer1()
+        self.test_segmentation_with_test_data()
 
-    def test_CAMalyzer1(self):
-        """ Ideally you should have several levels of tests.  At the lowest level
-        tests should exercise the functionality of the logic with different inputs
-        (both valid and invalid).  At higher levels your tests should emulate the
-        way the user would interact with your code and confirm that it still works
-        the way you intended.
-        One of the most important features of the tests is that it should alert other
-        developers when their changes will have an impact on the behavior of your
-        module.  For example, if a developer removes a feature that you depend on,
-        your test should break so they know that the feature is needed.
+    def test_segmentation_with_test_data(self):
         """
+        Test the segmentation logic using test data.
+        """
+        logging.info("Starting CAMalyzer test with test data.")
 
-        self.delayDisplay("Starting the test")
+        # Define the path to the test files
+        test_data_dir = "/home/notvenja24/Escritorio/CAMalyzer/CAMalyzer/CAMalyzer/Testing/Test_files"
+        volume_path = os.path.join(test_data_dir, "RU019FOVB.nii.gz")
+        model_path = os.path.join(test_data_dir, "Best_Model_2480.pth")
 
-        # Get/create input data
+        # Check that the test files exist
+        self.assertTrue(os.path.exists(volume_path), f"Test volume not found at {volume_path}")
+        self.assertTrue(os.path.exists(model_path), f"Test model not found at {model_path}")
 
-        import SampleData
-        registerSampleData()
-        inputVolume = SampleData.downloadSample('CAMalyzer1')
-        self.delayDisplay('Loaded test data set')
+        # Load the test volume
+        logging.info(f"Loading test volume from {volume_path}")
+        volume_node = slicer.util.loadVolume(volume_path)
+        self.assertIsNotNone(volume_node, "Failed to load test volume.")
 
-        inputScalarRange = inputVolume.GetImageData().GetScalarRange()
-        self.assertEqual(inputScalarRange[0], 0)
-        self.assertEqual(inputScalarRange[1], 695)
+        # Create output nodes
+        logging.info("Creating output nodes for label map and 3D model.")
+        output_label_map = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLLabelMapVolumeNode", "TestOutputLabelMap")
+        model_output = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLModelNode", "TestModelOutput")
 
-        outputVolume = slicer.mrmlScene.AddNewNodeByClass("vtkMRMLScalarVolumeNode")
-        threshold = 100
-
-        # Test the module logic
-
+        # Run the CAMalyzer logic
+        logging.info("Running CAMalyzer logic.")
         logic = CAMalyzerLogic()
+        logic.process(
+            inputVolume=volume_node,
+            modelForPrediction=model_path,
+            outputLabelMap=output_label_map,
+            modelOutput=model_output,
+            showResult=False  # Disable GUI updates for testing
+        )
 
-        # Test algorithm with non-inverted threshold
-        logic.process(inputVolume, outputVolume, threshold, True)
-        outputScalarRange = outputVolume.GetImageData().GetScalarRange()
-        self.assertEqual(outputScalarRange[0], inputScalarRange[0])
-        self.assertEqual(outputScalarRange[1], threshold)
+        # Validate the outputs
+        logging.info("Validating the outputs.")
+        self.assertIsNotNone(output_label_map.GetImageData(), "Label map was not generated.")
+        self.assertIsNotNone(model_output.GetPolyData(), "3D model was not generated.")
 
-        # Test algorithm with inverted threshold
-        logic.process(inputVolume, outputVolume, threshold, False)
-        outputScalarRange = outputVolume.GetImageData().GetScalarRange()
-        self.assertEqual(outputScalarRange[0], inputScalarRange[0])
-        self.assertEqual(outputScalarRange[1], inputScalarRange[1])
-
-        self.delayDisplay('Test passed')
+        logging.info("CAMalyzer test completed successfully.")
