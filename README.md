@@ -1,82 +1,61 @@
 # CAMalyzer
 
-<<<<<<< codex/modularize-repository-files-structure
-Modularized layout separating the thin 3D Slicer front-end from a pure-Python
-core package.
+CAMalyzer is a sample 3D Slicer extension that separates a thin Qt-based front-end from a pure-Python processing library. The project demonstrates how a Slicer module can delegate heavy work to a standalone package while keeping the GUI lightweight.
 
-```
-CAMalyzer.py        # Slicer module wrapper
-UI/                 # Qt designer files
-Resources/Icons/    # Icons used by the module
-camalyzer_core/     # Pure Python processing package
-    post/           # Post-processing helpers
-tests/              # PyTest-based tests
-```
-=======
-CAMalyzer is a 3D Slicer extension for automated image segmentation and
-3D model generation using deep‐learning models. The module wraps a
-PyTorch inference pipeline and provides a simple user interface for
-loading a volume, applying a trained network and visualising the
-resulting label map and surface model.
+## Directory structure
 
-## Installation
-
-1. Clone this repository in your Slicer extensions directory or use the
-   Extension Wizard to build it with CMake.
-2. Launch 3D Slicer and add the built extension to your Slicer
-   installation.
-3. After installation the module appears as **CAMalyzer** in the module
-   list.
-
-## Usage
-
-1. Load or download a volume. Two sample data sets are available via the
-   *Sample Data* module (look for **CAMalyzer1** and **CAMalyzer2**).
-2. Open the **CAMalyzer** module.
-3. Select the **Input Volume** to be segmented.
-4. Press **Browse** to choose the path to a trained `.pth` model
-   (required).
-5. Optionally select output nodes for the **Label Map** and **Model**.
-6. Click **Apply** to run the pipeline. The module runs the model,
-   creates a label map and converts it to a smoothed 3D surface.
+- `CAMalyzer.py` – Slicer module wrapper that exposes the user interface and delegates work to the core package.
+- `UI/` – Qt `.ui` files describing the module interface.
+- `Resources/` – Icon assets used by the module.
+- `camalyzer_core/` – Pure Python package with configuration, inference, I/O and post-processing utilities.
+- `tests/` – Pytest test suite for the core functionality.
 
 ## Classes and components
 
-### `CAMalyzer`
+### Slicer front-end (`CAMalyzer.py`)
 
-Module entry point that sets metadata and registers example data during
-startup【F:CAMalyzer/CAMalyzer/CAMalyzer.py†L32-L55】.
+- **`CAMalyzer`** – Registers the module with Slicer and defines metadata.
+- **`CAMalyzerWidget`** – Loads the Qt interface, wires up the Apply button and gathers user input.
+- **`CAMalyzerLogic`** – Lightweight wrapper that forwards the selected volume and model path to the core package.
 
-### `CAMalyzerParameterNode`
+### Core package (`camalyzer_core`)
 
-Typed storage for user inputs including the input volume, model path,
-output label map and generated 3D model【F:CAMalyzer/CAMalyzer/CAMalyzer.py†L112-L125】.
+- **`DEFAULT_CONFIG`** – Default hyper-parameters for the pipeline (`config.py`).
+- **`InferenceParams`** – Dataclass storing ROI size and threshold with validation (`params.py`).
+- **`segment_volume`** – Stub inference routine returning a zero-valued mask (`inference.py`).
+- **`check_optional_deps`** – Helper reporting missing optional libraries (`deps.py`).
+- **`load_model`, `load_volume`, `get_device`** – Simplified I/O utilities (`io.py`).
+- **Post-processing helpers** – `extract_surface`, `select_largest`, `poisson_reconstruct` (`post/`).
+- **Utility modules** – `vtkconv.py` for NumPy/Vtk conversions and `profiling.py` for a timing context manager.
 
-### `CAMalyzerWidget`
+## Usage
 
-Loads the Qt `.ui` file, connects GUI elements and handles events such as
-selecting the model path and running the process when **Apply** is
-pressed【F:CAMalyzer/CAMalyzer/CAMalyzer.py†L131-L172】【F:CAMalyzer/CAMalyzer/CAMalyzer.py†L262-L293】.
+### Core library
 
-### `CAMalyzerLogic`
+```python
+import numpy as np
+from camalyzer_core import segment_volume
 
-Core processing layer. It checks/installs Python dependencies, loads a
-UNet model applies sliding‑window inference and builds a smoothed 3D
-mesh from the segmentation【F:CAMalyzer/CAMalyzer/CAMalyzer.py†L306-L475】.
+volume = np.zeros((64, 64, 64))
+mask = segment_volume(volume)
+```
 
-### `CAMalyzerTest`
+### As a Slicer module
 
-Smoke tests demonstrating how to run the logic on sample data and verify
-results【F:C AMalyzer/CAMalyzer/CAMalyzer.py†L528-L590】.
+1. Copy this repository into a Slicer extensions directory or build it with the Extension Wizard.
+2. Launch 3D Slicer and load the **CAMalyzer** module.
+3. Select an input volume, choose a model file and press **Apply** to generate a label map.
 
-## Resources
+### Running tests
 
-- UI definition: `CAMalyzer/Resources/UI/CAMalyzer.ui`
-- Icons: `CAMalyzer/Resources/Icons`
+Install the test dependencies and run the suite:
+
+```bash
+pip install numpy pytest
+pytest
+```
 
 ## License
 
-This project inherits the licensing terms of 3D Slicer and the included
-dependencies. See individual files for details.
+This project inherits the licensing terms of 3D Slicer and its dependencies.
 
->>>>>>> main
