@@ -1,5 +1,7 @@
 # CAMalyzer
-
+<p align="center">
+  <img src="CAMalyzer.jpg" alt="CAMalyzer Logo" width="180">
+</p>
 CAMalyzer is a [3D Slicer](https://www.slicer.org/) extension that automatically segments 3 T hip MRI scans and generates a 3D model of the femoral head to assist in cam morphology analysis.
 
 ## Features
